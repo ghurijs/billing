@@ -28,6 +28,15 @@ export interface PlanConfig {
   trialPeriodDays?: number
 }
 
+/**
+ * An authentication class for the checkout and portal views: `@ghuri/rest`'s `BaseAuthentication` contract
+ * (`SessionAuthentication`, `TokenAuthentication`, `JWTAuthentication` from `@ghuri/auth/rest`, …).
+ */
+export type BillingAuthenticationClass = new () => {
+  authenticate(c: Context): Promise<[unknown, unknown] | null>
+  authenticateHeader?(c: Context): string | undefined
+}
+
 /** `BILLING` settings. Only `PROVIDER` is required. */
 export interface BillingSettings {
   /** The payment provider: `stripe({ secretKey, webhookSecret })`. */
@@ -36,9 +45,17 @@ export interface BillingSettings {
   SUBSCRIBER_MODEL?: string
   /**
    * Who pays for this request: an instance of `SUBSCRIBER_MODEL`, or null. Default: the authenticated request user.
-   * Multi-tenant apps: `(c) => currentTenant()`.
+   * Multi-tenant apps: `(c) => currentTenant()`. In the checkout and portal views it runs after
+   * `AUTHENTICATION_CLASSES`, so `getUser(c)` is the user they authenticated (or anonymous).
    */
   SUBSCRIBER?: (c: Context) => unknown | Promise<unknown>
+  /**
+   * How the checkout and portal views authenticate, as a REST API view does: the first class that returns a user
+   * wins, token / JWT requests skip CSRF, session requests must pass it. Default
+   * `REST_FRAMEWORK.DEFAULT_AUTHENTICATION_CLASSES`; without either, the session user of `AuthenticationMiddleware`
+   * (CSRF checked).
+   */
+  AUTHENTICATION_CLASSES?: BillingAuthenticationClass[]
   /** Plans by key. */
   PLANS?: Record<string, PlanConfig>
   /** Plan of a subscriber without an active subscription (default none: `getPlan()` returns key null). */
@@ -66,6 +83,8 @@ export interface ResolvedBillingSettings {
   PROVIDER?: BillingProvider
   SUBSCRIBER_MODEL: string
   SUBSCRIBER?: BillingSettings['SUBSCRIBER']
+  /** `BILLING.AUTHENTICATION_CLASSES`, else `REST_FRAMEWORK.DEFAULT_AUTHENTICATION_CLASSES`, else undefined. */
+  AUTHENTICATION_CLASSES?: BillingAuthenticationClass[]
   PLANS: Record<string, PlanConfig>
   DEFAULT_PLAN?: string
   ACTIVE_STATUSES: SubscriptionStatus[]
@@ -85,6 +104,11 @@ export function billingSettings(): ResolvedBillingSettings {
   return {
     ...s,
     SUBSCRIBER_MODEL: s.SUBSCRIBER_MODEL ?? (settings?.AUTH_USER_MODEL as string | undefined) ?? 'auth.User',
+    AUTHENTICATION_CLASSES:
+      s.AUTHENTICATION_CLASSES ??
+      (settings as { REST_FRAMEWORK?: { DEFAULT_AUTHENTICATION_CLASSES?: BillingAuthenticationClass[] } })
+        ?.REST_FRAMEWORK?.DEFAULT_AUTHENTICATION_CLASSES ??
+      undefined,
     PLANS: s.PLANS ?? {},
     ACTIVE_STATUSES: s.ACTIVE_STATUSES ?? DEFAULT_ACTIVE_STATUSES,
     SUCCESS_URL: s.SUCCESS_URL ?? '/',

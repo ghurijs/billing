@@ -58,15 +58,18 @@ stripe listen --forward-to localhost:8787/billing/webhook/   # local webhooks (S
 ```
 
 In Stripe, point a webhook endpoint at `https://<your app>/billing/webhook/` with at least `checkout.session.completed`,
-`customer.*`, `customer.subscription.*`, `product.*`, `price.*` and `invoice.*`.
+`checkout.session.async_payment_succeeded`, `customer.*`, `customer.subscription.*`, `product.*`, `price.*` and
+`invoice.*`.
 
 ```ts
-// app code
+// a plain view (in an APIView, use this.request.user)
+import { getUser } from '@ghuri/core'
 import { getSubscription, hasFeature, getEntitlements } from '@ghuri/billing'
 
-const sub = await getSubscription(request.user)        // Subscription | null
-if (await hasFeature(request.user, 'export')) { … }
-const { plan, limits } = await getEntitlements(request.user)
+const user = getUser(c)
+const sub = await getSubscription(user)                // Subscription | null
+if (await hasFeature(user, 'export')) { … }
+const { plan, limits } = await getEntitlements(user)
 ```
 
 ## 2. Plans and entitlements
@@ -85,7 +88,8 @@ subscription is on `DEFAULT_PLAN`.
 | `hasFeature(subject, feature)` | whether the plan lists the feature |
 
 A `subject` is a user or tenant instance, a `Customer`, a reference `{ type?, id }` or a Hono context. To keep access
-during dunning, add `'past_due'` to `ACTIVE_STATUSES`.
+during dunning, add `'past_due'` to `ACTIVE_STATUSES`. `requireSubscriber(c)` returns the request's subscriber or
+throws `NoSubscriber`, an HTTP error that answers 401.
 
 REST views use the permission classes in `@ghuri/billing/rest`; plain views use the decorator:
 
@@ -111,6 +115,29 @@ bought. `successUrl` / `cancelUrl` may be relative or on `ALLOWED_HOSTS`. `PLANS
 `POST billing/portal/` (optional `returnUrl`) opens the Stripe customer portal, where customers change plans, update
 cards and cancel.
 
+Both views authenticate like REST API views, so a single-page app calls them with the credentials it uses for the
+rest of its API: they are CSRF-exempt and run `BILLING.AUTHENTICATION_CLASSES` (default
+`REST_FRAMEWORK.DEFAULT_AUTHENTICATION_CLASSES`). Token and JWT requests need no CSRF token; session requests must pass
+the CSRF check, as with DRF's `SessionAuthentication`. Without either setting, the session user of
+`AuthenticationMiddleware` is used, CSRF checked. A request with no subscriber gets 401 (with `WWW-Authenticate` when
+the first authentication class has a scheme). `BILLING.SUBSCRIBER` runs afterwards, so `getUser(c)` in it is the
+authenticated user.
+
+```ts
+REST_FRAMEWORK: { DEFAULT_AUTHENTICATION_CLASSES: [SessionAuthentication, JWTAuthentication] },
+// or for billing only:
+BILLING: { AUTHENTICATION_CLASSES: [JWTAuthentication], … },
+```
+
+```ts
+// SPA
+await fetch('/billing/checkout/', {
+  method: 'POST',
+  headers: { authorization: `Bearer ${access}`, 'content-type': 'application/json' },
+  body: JSON.stringify({ plan: 'pro' }),
+}).then((r) => r.json())                      // { id, url } → location.href = url
+```
+
 ```html
 <form method="post" action="/billing/checkout/">
   <input type="hidden" name="csrfmiddlewaretoken" value="…">
@@ -124,8 +151,9 @@ cards and cancel.
 `POST billing/webhook/` is CSRF-exempt and authenticated by its signature (`Stripe-Signature`, HMAC-SHA256,
 timestamps within 300 s; `webhookSecret` may be a list while rotating). Each event is stored in `Event` by its id
 before processing, so a repeated delivery is acknowledged without running again. Processing upserts customers,
-products, prices, subscriptions (with their items) and invoices; a completed checkout links the customer and fetches
-its subscription. A subscription event older than the newest one applied is skipped. A failing event answers 500
+products, prices, subscriptions (with their items) and invoices; a completed checkout (`checkout.session.completed`,
+or `checkout.session.async_payment_succeeded` for delayed payment methods) links the customer and fetches its
+subscription. A subscription event older than the newest one applied is skipped. A failing event answers 500
 (Stripe retries) and keeps the error; `ghuri billing_process_events` or the admin action runs it again.
 
 With `@ghuri/tasks` installed, `BILLING.WEBHOOK_TASKS: true` answers at once and processes the event in the task
@@ -145,6 +173,19 @@ BILLING: {
 
 Customers reference their subscriber generically (`subscriberType` = model label, `subscriberId` = pk), so billing
 never imports `@ghuri/tenants` and the subscriber model needs no foreign key.
+
+Stripe's webhook carries no tenant. The webhook view is marked with `@ghuri/tenants`' `tenantNotRequired()` marker, so
+it is processed under `TENANTS.REQUIRED: true` (other requests without a tenant still answer 404; this needs a
+`@ghuri/tenants` with `tenantNotRequired()`, newer than 0.1.0-alpha.3). It runs with no tenant, which is fine for billing's own tables; a signal
+receiver that touches tenant-scoped models activates the subscriber's tenant itself:
+
+```ts
+subscriptionCreated.connect(async ({ subscription }) => {
+  const customer = await subscription.customer
+  const tenant = await Tenant.objects.get({ pk: customer.subscriberId })
+  await runAsTenant(tenant, () => Project.objects.filter({ archived: true }).update({ archived: false }))
+})
+```
 
 ## 6. Usage limits for agents
 

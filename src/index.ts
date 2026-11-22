@@ -59,6 +59,7 @@ export type {
   SubscriptionItemData,
 } from './provider'
 export {
+  type BillingAuthenticationClass,
   type BillingSettings,
   billingSettings,
   DEFAULT_ACTIVE_STATUSES,
