@@ -61,6 +61,10 @@ export interface HarnessOptions {
   billing?: (h: Harness) => Partial<BillingSettings>
   urls?: () => UrlEntry[]
   apps?: any[]
+  /** Replaces the default `[SessionMiddleware, CsrfMiddleware, AuthenticationMiddleware]`. */
+  middleware?: () => any[]
+  /** Extra settings (`TENANTS`, `REST_FRAMEWORK`, `LOGIN_URL`, …). */
+  settings?: () => Record<string, unknown>
 }
 
 export function useHarness(opts: HarnessOptions = {}): Harness {
@@ -93,10 +97,11 @@ export function useHarness(opts: HarnessOptions = {}): Harness {
           DemoConfig,
           ...(opts.apps ?? []),
         ],
-        MIDDLEWARE: [SessionMiddleware, CsrfMiddleware, AuthenticationMiddleware],
+        MIDDLEWARE: opts.middleware?.() ?? [SessionMiddleware, CsrfMiddleware, AuthenticationMiddleware],
         ROOT_URLCONF: [path('billing/', include(billingUrls)), ...(opts.urls?.() ?? [])],
         PASSWORD_HASHERS: [new PBKDF2PasswordHasher({ iterations: 1000 })],
         BILLING: h.billing,
+        ...(opts.settings?.() ?? {}),
         ...h.settings,
       })) as any,
       { checks: false },

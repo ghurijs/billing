@@ -1,15 +1,19 @@
 // Views: start a Checkout Session, open the customer portal, receive webhooks. Mount `billingUrls` under a prefix:
 // `path('billing/', include(billingUrls))`.
 import {
+  anonymousUser,
   BadRequest,
   csrfExempt,
+  enforceCsrf,
   getHost,
+  getUser,
   isAllowedHost,
   path,
+  type RequestUser,
+  setUser,
   tryGetContext,
   urlpatterns,
   type ViewFunction,
-  wantsJson,
 } from '@ghuri/core'
 import type { Context } from 'hono'
 import { getCustomer } from './access'
@@ -86,11 +90,48 @@ export function safeRedirectUrl(c: Context, value: string | undefined, fallback:
   return raw
 }
 
-function unauthenticated(c: Context): Response {
-  const login = tryGetContext()?.settings.LOGIN_URL as string | undefined
-  if (!wantsJson(c) && login && c.req.method === 'GET')
-    return c.redirect(`${login}?next=${encodeURIComponent(new URL(c.req.url).pathname)}`)
-  return jsonResponse({ detail: 'Authentication credentials were not provided.' }, 401)
+function unauthenticated(wwwAuthenticate?: string): Response {
+  const res = jsonResponse({ detail: 'Authentication credentials were not provided.' }, 401)
+  if (wwwAuthenticate) res.headers.set('WWW-Authenticate', wwwAuthenticate)
+  return res
+}
+
+/**
+ * Authenticate a checkout / portal request the way a REST API view does (both views are CSRF-exempt, like
+ * `APIView`): with `BILLING.AUTHENTICATION_CLASSES` (default `REST_FRAMEWORK.DEFAULT_AUTHENTICATION_CLASSES`) the
+ * first class that returns a user wins and becomes `getUser(c)`, session classes enforce CSRF and token / JWT
+ * classes do not; when none matches, the request is anonymous (an ambient session user is not used, so it cannot
+ * skip CSRF). Without classes, the session user of `AuthenticationMiddleware`, with CSRF enforced.
+ */
+async function authenticate(c: Context): Promise<{ user: RequestUser | null; wwwAuthenticate?: string }> {
+  const classes = billingSettings().AUTHENTICATION_CLASSES
+  if (classes?.length) {
+    const authenticators = classes.map((A) => new A())
+    for (const authenticator of authenticators) {
+      const result = await authenticator.authenticate(c)
+      if (result) {
+        setUser(c, result[0] as RequestUser)
+        return { user: result[0] as RequestUser }
+      }
+    }
+    setUser(c, anonymousUser)
+    return { user: null, wwwAuthenticate: authenticators[0]?.authenticateHeader?.(c) }
+  }
+  const user = getUser(c)
+  if (!user.isAuthenticated || user.isActive === false) return { user: null }
+  await enforceCsrf(c)
+  return { user }
+}
+
+/** The authenticated request's subscriber (`BILLING.SUBSCRIBER`, default the user), or a 401 response. */
+async function subscriberOrResponse(
+  c: Context,
+): Promise<{ subscriber: object; ref: SubscriberRef } | { response: Response }> {
+  const { user, wwwAuthenticate } = await authenticate(c)
+  const subscriber = await requestSubscriber(c, user ?? anonymousUser)
+  const ref = subscriber ? ((await resolveSubject(subscriber as object)) as SubscriberRef | null) : null
+  if (!subscriber || !ref) return { response: unauthenticated(wwwAuthenticate) }
+  return { subscriber: subscriber as object, ref }
 }
 
 export interface ResolvedPrice {
@@ -163,19 +204,22 @@ export async function resolveCheckoutPrice(input: {
   throw new BadRequest(`Unknown or inactive price '${input.price}'.`)
 }
 
-/** `POST checkout/`: a Checkout Session for the request's subscriber. */
-export const checkoutView: ViewFunction = async (c: Context) => {
+/**
+ * `POST checkout/`: a Checkout Session for the request's subscriber. Authenticates like an API view (session with
+ * CSRF, or token / JWT), so single-page apps can call it with their API credentials.
+ */
+export const checkoutView: ViewFunction = csrfExempt(async (c: Context) => {
   if (c.req.method !== 'POST') return jsonResponse({ detail: `Method "${c.req.method}" not allowed.` }, 405)
-  const subscriber = await requestSubscriber(c)
-  const ref = (await resolveSubject(subscriber as object)) as SubscriberRef | null
-  if (!subscriber || !ref) return unauthenticated(c)
+  const who = await subscriberOrResponse(c)
+  if ('response' in who) return who.response
+  const { subscriber, ref } = who
   const body = await readBody(c)
   const s = billingSettings()
   const resolved = await resolveCheckoutPrice({ plan: body.plan, price: body.price, interval: body.interval })
   const quantity = body.quantity ? Number(body.quantity) : 1
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10_000)
     throw new BadRequest('Invalid quantity.')
-  const customer = await getCustomer(subscriber as object, { create: true })
+  const customer = await getCustomer(subscriber, { create: true })
   const key = subscriberKey(ref)
   try {
     const session = await getProvider().createCheckoutSession({
@@ -195,15 +239,15 @@ export const checkoutView: ViewFunction = async (c: Context) => {
       return jsonResponse({ detail: err.message, code: err.code ?? null }, 502)
     throw err
   }
-}
+})
 
-/** `POST portal/`: a customer portal session for the request's subscriber. */
-export const portalView: ViewFunction = async (c: Context) => {
+/** `POST portal/`: a customer portal session for the request's subscriber. Authenticates like `checkout/`. */
+export const portalView: ViewFunction = csrfExempt(async (c: Context) => {
   if (c.req.method !== 'POST') return jsonResponse({ detail: `Method "${c.req.method}" not allowed.` }, 405)
-  const subscriber = await requestSubscriber(c)
-  if (!subscriber || !(await resolveSubject(subscriber as object))) return unauthenticated(c)
+  const who = await subscriberOrResponse(c)
+  if ('response' in who) return who.response
   const body = await readBody(c)
-  const customer = await getCustomer(subscriber as object, { create: true })
+  const customer = await getCustomer(who.subscriber, { create: true })
   try {
     const session = await getProvider().createPortalSession({
       customer: customer!.providerId,
@@ -215,9 +259,19 @@ export const portalView: ViewFunction = async (c: Context) => {
       return jsonResponse({ detail: err.message, code: err.code ?? null }, 502)
     throw err
   }
-}
+})
 
-/** `POST webhook/`: verify, store and process a provider event. CSRF-exempt (the signature authenticates it). */
+/**
+ * `@ghuri/tenants`' `tenantNotRequired()` marker (a `Symbol.for()` key, so billing does not import tenants): the
+ * provider's webhook carries no tenant, so it must not answer 404 under `TENANTS.REQUIRED`.
+ */
+const TENANT_NOT_REQUIRED = Symbol.for('ghuri.tenantNotRequired')
+
+/**
+ * `POST webhook/`: verify, store and process a provider event. CSRF-exempt (the signature authenticates it) and
+ * tenant-optional: it runs with no tenant under `TENANTS.REQUIRED`, since billing's tables are not tenant-scoped
+ * (signal receivers that touch tenant-scoped models use `runAsTenant()` with the customer's subscriber).
+ */
 export const webhookView: ViewFunction = csrfExempt(async (c: Context) => {
   if (c.req.method !== 'POST') return jsonResponse({ detail: `Method "${c.req.method}" not allowed.` }, 405)
   const body = await c.req.text()
@@ -230,6 +284,7 @@ export const webhookView: ViewFunction = csrfExempt(async (c: Context) => {
     return jsonResponse({ error: 'Webhook processing failed.' }, 500)
   }
 })
+;(webhookView as unknown as Record<symbol, boolean>)[TENANT_NOT_REQUIRED] = true
 
 /** `checkout/`, `portal/` and `webhook/` in the `billing` namespace. */
 export const billingUrls = urlpatterns('billing', [

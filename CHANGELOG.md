@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Fix:** the webhook view answered 404 in multi-tenant apps with `TENANTS.REQUIRED: true`, since Stripe's request
+  carries no tenant. It now carries `@ghuri/tenants`' `tenantNotRequired()` marker (`Symbol.for`, no import), so it
+  runs with no tenant there while other tenant-less requests still answer 404. Needs a `@ghuri/tenants` with
+  `tenantNotRequired()` (newer than 0.1.0-alpha.3); older versions ignore the marker.
+- **Fix:** `requireSubscriber()` gave a 500: `NoSubscriber` is now an `HttpError` with status 401 (`{ detail }`) in
+  plain views and API views. It no longer extends `BillingError`.
+- **Fix:** `checkout/` and `portal/` answered 401 (or 403 from `CsrfMiddleware`) to single-page apps that authenticate
+  with a token or JWT. They now authenticate like REST API views: CSRF-exempt, running the new
+  `BILLING.AUTHENTICATION_CLASSES` (default `REST_FRAMEWORK.DEFAULT_AUTHENTICATION_CLASSES`), where session classes
+  enforce CSRF and token / JWT classes do not; without either setting, the session user with CSRF enforced, as
+  before. When classes are set and none matches, the request is anonymous (an ambient session is not used).
+  A 401 carries `WWW-Authenticate` from the first class. Also exported: the `BillingAuthenticationClass` type.
+- Removed the unreachable `LOGIN_URL` redirect from the checkout / portal 401 (both views only accept POST).
+- README: `checkout.session.async_payment_succeeded` in the webhook events to send, `getUser(c)` in plain-view
+  snippets, authentication for SPAs, webhooks under `TENANTS.REQUIRED`.
+
 ## Unreleased (0.1.0-alpha.0)
 
 - First release: dj-stripe style subscriptions for Ghuri. The `BILLING` setting with a provider adapter;

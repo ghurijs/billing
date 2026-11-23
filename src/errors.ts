@@ -31,5 +31,13 @@ export class SignatureVerificationError extends HttpError {
   }
 }
 
-/** The request has no subscriber (`BILLING.SUBSCRIBER` returned nothing): not logged in, no tenant. */
-export class NoSubscriber extends BillingError {}
+/**
+ * The request has no subscriber (`BILLING.SUBSCRIBER` returned nothing): not logged in, no tenant. An HTTP error
+ * (401 `{ detail }`), so `requireSubscriber(c)` answers 401 in plain views and API views alike, not 500.
+ */
+export class NoSubscriber extends HttpError {
+  override status = 401
+  constructor(message = 'Authentication credentials were not provided.') {
+    super(message)
+  }
+}
