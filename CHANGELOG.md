@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.1
 
 - **Fix:** the webhook view answered 404 in multi-tenant apps with `TENANTS.REQUIRED: true`, since Stripe's request
   carries no tenant. It now carries `@ghuri/tenants`' `tenantNotRequired()` marker (`Symbol.for`, no import), so it
@@ -18,7 +18,7 @@
 - README: `checkout.session.async_payment_succeeded` in the webhook events to send, `getUser(c)` in plain-view
   snippets, authentication for SPAs, webhooks under `TENANTS.REQUIRED`.
 
-## Unreleased (0.1.0-alpha.0)
+## 0.1.0-alpha.0
 
 - First release: dj-stripe style subscriptions for Ghuri. The `BILLING` setting with a provider adapter;
   `stripe({ secretKey, webhookSecret })` talks to the Stripe REST API over `fetch` and verifies webhooks with
