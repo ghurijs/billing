@@ -1,6 +1,6 @@
 {
   "name": "@ghuri/billing",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "Ghuri billing: dj-stripe style subscriptions for SaaS apps — Stripe Checkout, the customer portal, verified idempotent webhooks, plans, entitlements and usage limits, on Workers and Node",
   "type": "module",
   "license": "MIT",
